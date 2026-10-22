@@ -108,3 +108,58 @@ final class QueueTests: XCTestCase {
     XCTAssertTrue(h.requests.allSatisfy { $0.events.count <= 25 })
   }
 }
+
+/// Going to the background is the last chance to send: the flush then sends everything.
+final class BackgroundFlushTests: XCTestCase {
+  func testABackgroundFlushSendsEverythingPendingNotJustFullBatches() async throws {
+    let h = Harness()
+    let tracker = h.tracker()
+    h.collector.reply(.status(503))
+
+    for i in 0..<24 { await tracker.event("e\(i)", at: h.clock.now) }
+    await h.fire()  // 503: kept, 5 s of backoff
+    for i in 24..<40 { await tracker.event("e\(i)", at: h.clock.now) }
+    h.clock.advance(by: 5)  // the backoff is over; its wake has not fired
+    await tracker.flush(draining: true)
+
+    let batches = h.requests.dropFirst().map(\.names)
+    XCTAssertEqual(batches.map(\.count), [25, 15])
+    let pending = await tracker.pendingCount
+    XCTAssertEqual(pending, 0)
+    XCTAssertTrue(h.scheduler.pending.isEmpty)
+  }
+
+  func testABackgroundFlushWaitsForTheRequestInFlightThenSendsTheRest() async throws {
+    let h = Harness()
+    let tracker = h.tracker()
+    let gate = Gate()
+    h.collector.reply(.held(gate, then: .accepted(1)))
+
+    await tracker.view("Home", at: h.clock.now)
+    let wake = Task { await h.fire() }  // the 5 s flush, held in flight
+    await fulfillment(of: [gate.arrived], timeout: 5)
+    await tracker.event("late", at: h.clock.now)
+    let background = Task { await tracker.flush(draining: true) }
+    gate.open()
+    await wake.value
+    await background.value
+
+    XCTAssertEqual(h.requests.map(\.names), [["view"], ["late"]])
+    let pending = await tracker.pendingCount
+    XCTAssertEqual(pending, 0)
+  }
+
+  func testTheOverflowIsLoggedOncePerOutage() async throws {
+    let h = Harness()
+    let tracker = h.tracker()
+    h.collector.alwaysReply(.status(503))
+
+    for i in 0..<510 { await tracker.event("e\(i)", at: h.clock.now) }
+    for _ in 0..<3 {
+      await h.fire()
+      for i in 0..<30 { await tracker.event("more\(i)", at: h.clock.now) }
+    }
+
+    XCTAssertEqual(h.log.messages(at: .error).filter { $0.contains("oldest") }.count, 1)
+  }
+}

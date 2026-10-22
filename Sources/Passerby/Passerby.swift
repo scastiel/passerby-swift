@@ -115,7 +115,6 @@ private final class Client: Sendable {
   let tracker: Tracker
   private let now: @Sendable () -> Date
   private let commands: AsyncStream<Command>.Continuation
-  private let consumer: Task<Void, Never>
   private let observer: Observation
 
   init(appKey: String, url: URL, environment: Environment) {
@@ -124,15 +123,16 @@ private final class Client: Sendable {
     self.tracker = tracker
     self.now = environment.now
     self.commands = commands
-    self.consumer = Task {
+    Task {
       for await command in stream {
         switch command {
         case let .record(record, date):
           await tracker.record(record, at: date)
         case let .flush(done):
-          await tracker.flush()
+          await tracker.flush(draining: true)
           done.resume()
         case let .barrier(done):
+          await tracker.idle()
           done.resume()
         }
       }
@@ -143,7 +143,9 @@ private final class Client: Sendable {
       name: UIApplication.didEnterBackgroundNotification
     ) {
       runInBackground {
-        await withCheckedContinuation { commands.yield(.flush($0)) }
+        await withCheckedContinuation { done in
+          if case .terminated = commands.yield(.flush(done)) { done.resume() }
+        }
       }
     }
   }
@@ -153,13 +155,16 @@ private final class Client: Sendable {
   }
 
   func drain() async {
-    await withCheckedContinuation { commands.yield(.barrier($0)) }
+    await withCheckedContinuation { done in
+      if case .terminated = commands.yield(.barrier(done)) { done.resume() }
+    }
   }
 
+  /// Stops watching and accepting calls; the consumer works through what is buffered, so
+  /// every waiting `drain` or background flush returns.
   func stop() {
     observer.cancel()
     commands.finish()
-    consumer.cancel()
   }
 }
 

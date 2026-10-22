@@ -6,13 +6,27 @@ import XCTest
 // MARK: - The Collector, stubbed at the URLProtocol level
 
 /// What the stub answers to one request.
-enum StubReply {
+enum StubReply: Sendable {
   case status(Int, headers: [String: String] = [:], body: String = #"{"accepted":0,"rejected":[]}"#)
   case networkError
+  /// Holds the request in flight until the test opens the gate, then answers `reply`.
+  indirect case held(Gate, then: StubReply)
 
   static func accepted(_ n: Int = 0) -> StubReply {
     .status(200, body: #"{"accepted":\#(n),"rejected":[]}"#)
   }
+}
+
+struct Unchecked<Value>: @unchecked Sendable {
+  let value: Value
+  init(_ value: Value) { self.value = value }
+}
+
+/// Where a held request waits: `arrived` once it is in flight, `open()` to let it answer.
+final class Gate: @unchecked Sendable {
+  let arrived = XCTestExpectation(description: "the request is in flight")
+  fileprivate let semaphore = DispatchSemaphore(value: 0)
+  func open() { semaphore.signal() }
 }
 
 /// One request the Tracker sent, with its body decoded.
@@ -69,7 +83,19 @@ final class StubURLProtocol: URLProtocol {
 
   override func startLoading() {
     let body = request.httpBody ?? request.httpBodyStream.map(Self.read) ?? Data()
-    switch StubCollector.shared.handle(request, body: body) {
+    answer(StubCollector.shared.handle(request, body: body))
+  }
+
+  private func answer(_ reply: StubReply) {
+    switch reply {
+    case let .held(gate, then):
+      gate.arrived.fulfill()
+      // URLProtocol is driven from one thread at a time; the hop just waits for the gate.
+      let loader = Unchecked(self)
+      DispatchQueue.global().async {
+        gate.semaphore.wait()
+        loader.value.answer(then)
+      }
     case let .status(code, headers, text):
       let response = HTTPURLResponse(
         url: request.url!, statusCode: code, httpVersion: "HTTP/1.1",
@@ -242,12 +268,15 @@ struct Harness {
 }
 
 extension Tracker {
+  /// Records a View and waits for any flush it started.
   func view(_ screen: String, props: [String: Property] = [:], at date: Date) async {
-    await record(.view(screen: screen, props: props), at: date)
+    record(.view(screen: screen, props: props), at: date)
+    await idle()
   }
 
   func event(_ name: String, props: [String: Property] = [:], at date: Date) async {
-    await record(.event(name: name, props: props), at: date)
+    record(.event(name: name, props: props), at: date)
+    await idle()
   }
 }
 

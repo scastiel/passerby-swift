@@ -159,3 +159,37 @@ final class DeliveryTests: XCTestCase {
     XCTAssertEqual(h.scheduler.pending, [60])
   }
 }
+
+/// Hostile or broken input the Tracker must survive.
+final class RobustnessTests: XCTestCase {
+  func testAnUnparsableRetryAfterFallsBackToTheBackoff() async throws {
+    for header in ["nan", "inf", "-3", "Wed, 21 Oct 2026 07:28:00 GMT"] {
+      let h = Harness()
+      let tracker = h.tracker()
+      h.collector.reply(.status(429, headers: ["Retry-After": header]))
+
+      await tracker.view("Home", at: h.clock.now)
+      await h.fire()
+
+      let expected: TimeInterval = header == "-3" ? 0 : 5
+      XCTAssertEqual(h.scheduler.pending, [expected], "Retry-After: \(header)")
+    }
+  }
+
+  func testANonFiniteNumberDropsOnlyItsEventAndSaysWhy() async throws {
+    let h = Harness()
+    let tracker = h.tracker()
+
+    await tracker.view("Home", at: h.clock.now)
+    await tracker.event("ratio", props: ["r": .number(.nan)], at: h.clock.now)
+    await tracker.event("big", props: ["r": .number(.infinity)], at: h.clock.now)
+    await tracker.event("ok", props: ["r": 0.5], at: h.clock.now)
+    await h.fire()
+
+    XCTAssertEqual(h.requests.count, 1)
+    XCTAssertEqual(h.requests[0].names, ["view", "ok"])
+    let errors = h.log.messages(at: .error)
+    XCTAssertEqual(errors.count, 2, "\(errors)")
+    XCTAssertTrue(errors[0].contains("ratio") && errors[0].contains("finite"), errors[0])
+  }
+}

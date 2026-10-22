@@ -46,11 +46,21 @@ struct Environment: Sendable {
   }()
 
   @Sendable private static func runWhileExpiring(_ work: @escaping @Sendable () async -> Void) {
+    let started = OSAllocatedUnfairLock(initialState: false)
     ProcessInfo.processInfo.performExpiringActivity(
       withReason: "Passerby: send the pending Events"
     ) { expired in
-      // Called a second time with `true` when the time is up; the first call is still waiting.
-      guard !expired else { return }
+      // Called a second time with `true` when the time is up, while the first call still waits.
+      let first = started.withLock { started in
+        defer { started = true }
+        return !started
+      }
+      guard first else { return }
+      // Called only with `true` when no time could be had: try anyway, unguarded.
+      guard !expired else {
+        Task { await work() }
+        return
+      }
       let done = DispatchSemaphore(value: 0)
       Task {
         await work()

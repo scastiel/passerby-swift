@@ -25,6 +25,10 @@ actor Tracker {
 
   private var pending: [WireEvent] = []
   private var isSending = false
+  /// Flushes waiting for the request in flight to end.
+  private var sendWaiters: [CheckedContinuation<Void, Never>] = []
+  /// The flush the 25th pending Event started.
+  private var batchFlush: Task<Void, Never>?
   private var wake: (any Cancellable)?
   /// Bumped on every cancellation, so a wake that already left its sleep cannot run late.
   private var wakeGeneration = 0
@@ -32,6 +36,13 @@ actor Tracker {
   private var failures = 0
   private var retryAt: Date?
   private var isOverflowing = false
+
+  private let encoder: JSONEncoder = {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+    return encoder
+  }()
+  private let decoder = JSONDecoder()
 
   init(appKey: String, url: URL, environment: Environment) {
     self.appKey = appKey
@@ -41,40 +52,65 @@ actor Tracker {
 
   var pendingCount: Int { pending.count }
 
-  func record(_ record: Record, at date: Date) async {
+  /// Queues an Event. Returns at once: a flush it triggers runs on its own.
+  func record(_ record: Record, at date: Date) {
+    let name: String
+    let props: [String: Property]
+    let screen: String?
+    switch record {
+    case let .view(viewScreen, viewProps):
+      (name, props, screen) = ("view", viewProps, viewScreen)
+    case let .event(eventName, eventProps):
+      (name, props, screen) = (eventName, eventProps, lastScreen)
+    }
+    // Not a Property check (the Collector judges those): JSON has no NaN or infinity, and one
+    // such value would fail the encoding of the whole batch.
+    if let key = Self.nonFiniteKey(in: props) {
+      environment.log.log(
+        .error,
+        "\(name) on \(screen ?? "no Screen") dropped: Property \(key) is not a finite number")
+      return
+    }
+
     if let last = lastEventAt, date.timeIntervalSince(last) > Self.visitTimeout {
       visit = UUID().uuidString
     }
     lastEventAt = date
+    lastScreen = screen
 
-    let name: String
-    let props: [String: Property]
-    switch record {
-    case let .view(screen, viewProps):
-      lastScreen = screen
-      name = "view"
-      props = viewProps
-    case let .event(eventName, eventProps):
-      name = eventName
-      props = eventProps
-    }
     pending.append(
       WireEvent(
-        ts: Timestamp.string(from: date), visit: visit, name: name, screen: lastScreen,
+        ts: Timestamp.string(from: date), visit: visit, name: name, screen: screen,
         appVersion: environment.device.appVersion, device: environment.device.model,
         props: props.isEmpty ? nil : props))
     trimToCapacity()
 
     if pending.count >= Self.batchSize {
-      await flush()
+      if batchFlush == nil {
+        batchFlush = Task {
+          await flush()
+          batchFlush = nil
+        }
+      }
     } else if wake == nil, !isSending {
       scheduleWake()
     }
   }
 
+  /// Waits for the flush the 25th Event started, if any.
+  func idle() async {
+    while let task = batchFlush { await task.value }
+  }
+
   /// Sends one batch, then another straight away while 25 more are waiting. Does nothing while
   /// a request is in flight or a backoff is running.
-  func flush() async {
+  ///
+  /// `draining`, for the app going to the background: waits for the request in flight, then
+  /// sends everything pending (still respecting a backoff), since no wake may come after.
+  func flush(draining: Bool = false) async {
+    if draining {
+      while isSending { await withCheckedContinuation { sendWaiters.append($0) } }
+    }
     while !isSending, !pending.isEmpty, !isBackingOff {
       cancelWake()
       isSending = true
@@ -84,10 +120,14 @@ actor Tracker {
       let outcome = await send(batch)
 
       isSending = false
+      let waiters = sendWaiters
+      sendWaiters = []
+      waiters.forEach { $0.resume() }
       switch outcome {
       case .done:
         failures = 0
         retryAt = nil
+        isOverflowing = false
       case let .retry(retryAfter, reason):
         pending.insert(contentsOf: batch, at: 0)
         trimToCapacity()
@@ -99,7 +139,7 @@ actor Tracker {
         retryAt = environment.now().addingTimeInterval(delay)
         environment.log.log(.error, "\(reason); retrying in \(Int(delay.rounded())) s")
       }
-      if pending.count < Self.batchSize { break }
+      if !draining, pending.count < Self.batchSize { break }
     }
     if !isSending { scheduleWake() }
   }
@@ -135,10 +175,7 @@ actor Tracker {
 
   private func trimToCapacity() {
     let excess = pending.count - Self.capacity
-    guard excess > 0 else {
-      isOverflowing = false
-      return
-    }
+    guard excess > 0 else { return }
     pending.removeFirst(excess)
     if !isOverflowing {
       isOverflowing = true
@@ -162,12 +199,10 @@ actor Tracker {
     request.httpMethod = "POST"
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue(environment.device.userAgent, forHTTPHeaderField: "User-Agent")
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
     do {
       request.httpBody = try encoder.encode(Envelope(app: appKey, events: batch))
     } catch {
-      // Unreachable with these types (a non-finite Double is the one way); never retried.
+      // Unreachable: `record` turns away the one value JSON cannot carry, a non-finite number.
       environment.log.log(.error, "dropped \(batch.count) Events: \(error)")
       return .done
     }
@@ -183,7 +218,7 @@ actor Tracker {
       return .retry("no HTTP response")
     }
 
-    let verdict = try? JSONDecoder().decode(Verdict.self, from: data)
+    let verdict = try? decoder.decode(Verdict.self, from: data)
     let status = http.statusCode
     switch status {
     case 200..<300:
@@ -195,7 +230,7 @@ actor Tracker {
     case 429:
       let retryAfter = http.value(forHTTPHeaderField: "Retry-After")
         .flatMap { TimeInterval($0.trimmingCharacters(in: .whitespaces)) }
-        .map { max($0, 0) }
+        .flatMap { $0.isFinite ? max($0, 0) : nil }
       return .retry(after: retryAfter, reason: "HTTP 429 (throttled)")
     case 400..<500:
       environment.log.log(
@@ -215,6 +250,13 @@ actor Tracker {
         .error,
         "Event \(rejection.index) (\(name)) rejected: \(rejection.code): \(rejection.message)")
     }
+  }
+
+  private static func nonFiniteKey(in props: [String: Property]) -> String? {
+    props.first { _, value in
+      if case .number(let number) = value { return !number.isFinite }
+      return false
+    }?.key
   }
 
   private func reason(_ verdict: Verdict?, _ data: Data) -> String {
