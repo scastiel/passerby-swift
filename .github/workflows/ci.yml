@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest supported toolchain: Xcode 15, Swift 5.9 language mode.
+          - name: Xcode 15.4
+            runner: macos-14
+            xcode: /Applications/Xcode_15.4.app
+            settings: ""
+          # The current toolchain, in the Swift 6 language mode with warnings as errors.
+          - name: Swift 6
+            runner: macos-15
+            xcode: ""
+            settings: SWIFT_VERSION=6 SWIFT_TREAT_WARNINGS_AS_ERRORS=YES
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        if: matrix.xcode != ''
+        run: sudo xcode-select -s "${{ matrix.xcode }}"
+      - name: Pick an iPhone simulator
+        run: |
+          xcodebuild -version
+          udid=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          print(next(d["udid"] for runtime, ds in sorted(devices.items(), reverse=True)
+                     if ".iOS-" in runtime for d in ds if d["name"].startswith("iPhone")))')
+          echo "SIMULATOR=$udid" >> "$GITHUB_ENV"
+      - name: xcodebuild test
+        run: |
+          set -o pipefail
+          xcodebuild test -scheme Passerby -destination "id=$SIMULATOR" \
+            ${{ matrix.settings }} | tee xcodebuild.log
+          ! grep -E "^/.*(warning|error):" xcodebuild.log
