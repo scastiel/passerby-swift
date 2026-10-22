@@ -13,7 +13,7 @@ final class PublicAPITests: XCTestCase {
 
   private static func flushInBackground(_ h: Harness) async {
     await Passerby.drain()
-    h.notifications.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
+    postDidEnterBackground(on: h.notifications)
     await h.background.runAll()
   }
 

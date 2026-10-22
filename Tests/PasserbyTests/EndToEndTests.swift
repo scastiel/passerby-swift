@@ -23,7 +23,7 @@ final class EndToEndTests: XCTestCase {
     Passerby.event("e2e_signup", props: ["plan": "pro", "seats": 3, "trial": true])
     // The real path: the notification, the expiring activity, URLSession.
     await Passerby.drain()
-    NotificationCenter.default.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
+    postDidEnterBackground(on: .default)
 
     let deadline = Date().addingTimeInterval(20)
     while Date() < deadline, !log.all.contains(where: { $0.1.hasPrefix("sent") }) {

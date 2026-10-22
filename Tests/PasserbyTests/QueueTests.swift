@@ -43,7 +43,7 @@ final class QueueTests: XCTestCase {
     Passerby.view("Home")
     await Passerby.drain()
     XCTAssertTrue(h.requests.isEmpty)
-    h.notifications.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
+    postDidEnterBackground(on: h.notifications)
     await h.background.runAll()
 
     XCTAssertEqual(h.requests.count, 1)

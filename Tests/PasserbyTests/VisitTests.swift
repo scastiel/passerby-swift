@@ -57,7 +57,7 @@ final class VisitTests: XCTestCase {
 
     Passerby.view("Home")
     await Passerby.drain()
-    h.notifications.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
+    postDidEnterBackground(on: h.notifications)
     await h.background.runAll()
     h.clock.advance(by: 10 * 60)
     Passerby.event("resumed")

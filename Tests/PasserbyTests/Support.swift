@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 import XCTest
 @testable import Passerby
 
@@ -248,4 +249,10 @@ extension Tracker {
   func event(_ name: String, props: [String: Property] = [:], at date: Date) async {
     await record(.event(name: name, props: props), at: date)
   }
+}
+
+/// Posts what UIKit posts when the app enters the background. Synchronous, because the Xcode 15
+/// SDK isolates the notification's name to the main actor and an async test could not read it.
+func postDidEnterBackground(on center: NotificationCenter) {
+  center.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
 }

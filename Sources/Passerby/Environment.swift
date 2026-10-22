@@ -131,7 +131,8 @@ protocol LogSink: Sendable {
 }
 
 /// `os.Logger` under the package's bundle id: sends at `.debug`, failures at `.error`.
-struct OSLogSink: LogSink {
+/// `Logger` is thread-safe; the Xcode 15 SDK just does not mark it Sendable yet.
+struct OSLogSink: LogSink, @unchecked Sendable {
   private let logger = Logger(
     subsystem: Passerby.resources.bundleIdentifier ?? "passerby-swift", category: "Passerby")
 
